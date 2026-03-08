@@ -1,0 +1,15 @@
+# Full dependencies for deploying the Dog Matching API (e.g. Railway).
+# Use this when deploying; the api/ folder alone does not include torch/Pillow.
+# For smaller image size on Railway (CPU-only), you can replace torch/torchvision with:
+#   --extra-index-url https://download.pytorch.org/whl/cpu
+#   torch
+#   torchvision
+torch>=1.12.0
+torchvision>=0.13.0
+Pillow>=9.0.0
+requests>=2.28.0
+fastapi>=0.100.0
+uvicorn[standard]>=0.22.0
+python-multipart>=0.0.6
+scikit-learn>=1.0.0
+numpy>=1.21.0

@@ -1,0 +1,10 @@
+# Railway config: Dog Matching FastAPI
+# See https://docs.railway.com/guides/config-as-code
+
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "uvicorn api.main:app --host 0.0.0.0 --port $PORT"
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 3
