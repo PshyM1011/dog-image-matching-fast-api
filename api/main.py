@@ -34,7 +34,7 @@ from src.utils.evaluation import cosine_similarity_search
 
 
 # --- Config from environment ---
-CHECKPOINT_PATH = os.environ.get("CHECKPOINT_PATH", "checkpoints/best.pth")
+CHECKPOINT_PATH = os.environ.get("CHECKPOINT_PATH", "best.pth")
 GALLERY_PATH = os.environ.get("GALLERY_PATH", "gallery_embeddings.pt")
 GALLERY_API_URL = os.environ.get("GALLERY_API_URL")  # Express endpoint for lost dogs (for rebuild-gallery)
 DEVICE = os.environ.get("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
