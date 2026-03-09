@@ -1,4 +1,3 @@
-```bash
 #!/bin/bash
 set -e
 if [ -z "$CHECKPOINT_URL" ]; then
@@ -8,4 +7,3 @@ fi
 echo "Downloading checkpoint from $CHECKPOINT_URL ..."
 curl -fSL -o best.pth "$CHECKPOINT_URL"
 echo "Done. best.pth is in project root."
-```
