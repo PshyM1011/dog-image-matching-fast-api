@@ -5,7 +5,7 @@ Includes similarity search, re-ranking, and accuracy metrics.
 import os
 import torch
 import numpy as np
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 from sklearn.metrics.pairwise import cosine_similarity
 
 # FAISS is optional - will fall back to cosine similarity if not available
@@ -106,6 +106,72 @@ def cosine_similarity_search(
     top_similarities, top_indices = torch.topk(similarities, k=min(top_k, len(similarities)))
     
     return top_similarities, top_indices
+
+
+def cosine_similarity_1vN(
+    query_embedding: torch.Tensor,
+    gallery_rows: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Cosine similarity between one L2-normalized or arbitrary query vector and N gallery rows.
+    Normalizes query and each row; returns shape [N].
+    """
+    q = query_embedding.flatten()
+    q = q / (q.norm(p=2) + 1e-12)
+    g = gallery_rows / (gallery_rows.norm(p=2, dim=1, keepdim=True) + 1e-12)
+    return (g @ q).view(-1)
+
+
+def rerank_with_dual_view_ensemble(
+    query_fused: torch.Tensor,
+    query_frontal: torch.Tensor,
+    query_lateral: torch.Tensor,
+    gallery_fused: torch.Tensor,
+    candidate_indices: torch.Tensor,
+    gallery_frontal: Optional[torch.Tensor],
+    gallery_lateral: Optional[torch.Tensor],
+    w_fused: float,
+    w_front: float,
+    w_lat: float,
+    min_cosine: float,
+) -> List[Tuple[int, float, float]]:
+    """
+    Re-rank retrieval candidates using fused + per-view cosine ensemble when gallery
+    stores frontal/lateral vectors; otherwise uses fused similarity only.
+
+    Returns a list of (gallery_row_index, ensemble_score, confidence01). confidence01
+    is (ensemble_score + 1) / 2 in [0, 1]. When min_cosine > -1, candidates meeting the
+    threshold are ordered before those below it; within each group, higher scores first.
+    """
+    device = query_fused.device
+    idx = candidate_indices.long().to(device)
+
+    gf = gallery_fused.index_select(0, idx)
+    s_fused = cosine_similarity_1vN(query_fused, gf)
+
+    if gallery_frontal is not None and gallery_lateral is not None:
+        g_front = gallery_frontal.index_select(0, idx)
+        g_lat = gallery_lateral.index_select(0, idx)
+        s_front = cosine_similarity_1vN(query_frontal, g_front)
+        s_lat = cosine_similarity_1vN(query_lateral, g_lat)
+        ensemble = w_fused * s_fused + w_front * s_front + w_lat * s_lat
+    else:
+        ensemble = s_fused
+
+    # Pack scores
+    rows: List[Tuple[int, float, float, bool]] = []
+    for j in range(idx.shape[0]):
+        gidx = int(idx[j].item())
+        score = float(ensemble[j].item())
+        conf = (score + 1.0) / 2.0
+        ok = score >= min_cosine if min_cosine > -1.0 + 1e-9 else True
+        rows.append((gidx, score, conf, ok))
+
+    # Prefer candidates that meet threshold, then by score
+    rows.sort(key=lambda x: (x[3], x[1]), reverse=True)
+
+    out: List[Tuple[int, float, float]] = [(gidx, sc, cf) for gidx, sc, cf, _ in rows]
+    return out
 
 
 def faiss_search(
