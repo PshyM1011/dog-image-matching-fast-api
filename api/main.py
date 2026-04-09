@@ -10,6 +10,11 @@ Optional: set GALLERY_API_URL so POST /admin/rebuild-gallery can refresh the gal
 
 Windows PowerShell:
   $env:CHECKPOINT_PATH="checkpoints/best.pth"; $env:GALLERY_PATH="gallery_embeddings.pt"; uvicorn api.main:app --host 0.0.0.0 --port 8000
+
+Re-ranking (optional env): MATCH_RETRIEVE_K (default 10), MATCH_DEFAULT_TOP_K (default 5),
+ENSEMBLE_W_FUSED / ENSEMBLE_W_FRONT / ENSEMBLE_W_LAT (default 0.5/0.25/0.25),
+RERANK_MIN_COSINE in [-1,1] (default -1 = off). Rebuild gallery after upgrade to store
+frontal_embeddings + lateral_embeddings for dual-view ensemble re-ranking.
 """
 import os
 import sys
@@ -30,7 +35,7 @@ from pydantic import BaseModel
 
 from src.model import DualViewFusionModel
 from src.preprocessing import get_test_transforms
-from src.utils.evaluation import cosine_similarity_search
+from src.utils.evaluation import cosine_similarity_search, rerank_with_dual_view_ensemble
 
 
 # --- Config from environment ---
@@ -38,6 +43,20 @@ CHECKPOINT_PATH = os.environ.get("CHECKPOINT_PATH", "best.pth")
 GALLERY_PATH = os.environ.get("GALLERY_PATH", "gallery_embeddings.pt")
 GALLERY_API_URL = os.environ.get("GALLERY_API_URL")  # Express endpoint for lost dogs (for rebuild-gallery)
 DEVICE = os.environ.get("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
+
+# Re-ranking: retrieve a wide candidate set, then re-score with fused + per-view cosine ensemble
+MATCH_RETRIEVE_K = int(os.environ.get("MATCH_RETRIEVE_K", "10"))
+MATCH_DEFAULT_TOP_K = int(os.environ.get("MATCH_DEFAULT_TOP_K", "5"))
+# Ensemble weights (normalized to sum to 1): fused vs frontal-only vs lateral-only gallery vectors
+_wf = float(os.environ.get("ENSEMBLE_W_FUSED", "0.5"))
+_wfr = float(os.environ.get("ENSEMBLE_W_FRONT", "0.25"))
+_wlat = float(os.environ.get("ENSEMBLE_W_LAT", "0.25"))
+_s = _wf + _wfr + _wlat
+ENSEMBLE_W_FUSED = _wf / _s
+ENSEMBLE_W_FRONT = _wfr / _s
+ENSEMBLE_W_LAT = _wlat / _s
+# Min cosine in [-1, 1] for re-ranked score; -1 disables (see /match min_rerank_cosine)
+RERANK_MIN_COSINE = float(os.environ.get("RERANK_MIN_COSINE", "-1"))
 
 # CORS: allow Flutter web and common dev origins (required when Flutter web calls this API from the browser)
 _CORS_ORIGINS_ENV = os.environ.get("CORS_ORIGINS", "").strip()
@@ -66,14 +85,22 @@ def load_model_and_gallery():
     model.eval()
     
     gallery_embeddings = None
+    gallery_frontal = None
+    gallery_lateral = None
     gallery_ids = []
     
     if os.path.exists(GALLERY_PATH):
         data = torch.load(GALLERY_PATH, map_location=device)
         gallery_embeddings = data["embeddings"]
         gallery_ids = data["ids"]
+        gallery_frontal = data.get("frontal_embeddings")
+        gallery_lateral = data.get("lateral_embeddings")
+        if gallery_frontal is not None:
+            gallery_frontal = gallery_frontal.to(device)
+        if gallery_lateral is not None:
+            gallery_lateral = gallery_lateral.to(device)
     
-    return model, gallery_embeddings, gallery_ids, device
+    return model, gallery_embeddings, gallery_frontal, gallery_lateral, gallery_ids, device
 
 
 def _fetch_dogs_from_api(api_url: str) -> List[Dict[str, Any]]:
@@ -130,8 +157,9 @@ def _rebuild_gallery_from_api() -> int:
         raise RuntimeError("Model not loaded.")
 
     dogs = _fetch_dogs_from_api(GALLERY_API_URL)
-    transform = get_test_transforms()
     embeddings_list: List[torch.Tensor] = []
+    frontal_list: List[torch.Tensor] = []
+    lateral_list: List[torch.Tensor] = []
     ids_list: List[str] = []
 
     for i, dog in enumerate(dogs):
@@ -151,16 +179,28 @@ def _rebuild_gallery_from_api() -> int:
         except Exception:
             continue
         with torch.no_grad():
-            emb = _model(front_t, side_t).squeeze(0).cpu()
-        embeddings_list.append(emb)
+            fused = _model(front_t, side_t).squeeze(0).cpu()
+            fe = _model.encode_frontal(front_t).squeeze(0).cpu()
+            le = _model.encode_lateral(side_t).squeeze(0).cpu()
+        embeddings_list.append(fused)
+        frontal_list.append(fe)
+        lateral_list.append(le)
         ids_list.append(dog_id)
 
     if not embeddings_list:
         raise RuntimeError("No valid dogs to embed. Check API response and image URLs.")
 
     gallery_tensor = torch.stack(embeddings_list)
+    frontal_tensor = torch.stack(frontal_list)
+    lateral_tensor = torch.stack(lateral_list)
     torch.save(
-        {"embeddings": gallery_tensor, "ids": ids_list, "checkpoint_path": CHECKPOINT_PATH},
+        {
+            "embeddings": gallery_tensor,
+            "frontal_embeddings": frontal_tensor,
+            "lateral_embeddings": lateral_tensor,
+            "ids": ids_list,
+            "checkpoint_path": CHECKPOINT_PATH,
+        },
         GALLERY_PATH,
     )
     return len(ids_list)
@@ -168,19 +208,32 @@ def _rebuild_gallery_from_api() -> int:
 
 def _reload_gallery_from_disk() -> int:
     """Re-read gallery from GALLERY_PATH and update in-memory state. Returns new gallery size."""
-    global _gallery_embeddings, _gallery_ids
+    global _gallery_embeddings, _gallery_frontal, _gallery_lateral, _gallery_ids
     if not os.path.exists(GALLERY_PATH):
         _gallery_embeddings = None
+        _gallery_frontal = None
+        _gallery_lateral = None
         _gallery_ids = []
         return 0
     data = torch.load(GALLERY_PATH, map_location=_device)
     _gallery_embeddings = data["embeddings"]
     _gallery_ids = data["ids"]
+    _gallery_frontal = data.get("frontal_embeddings")
+    _gallery_lateral = data.get("lateral_embeddings")
+    if _gallery_frontal is not None:
+        _gallery_frontal = _gallery_frontal.to(_device)
+    if _gallery_lateral is not None:
+        _gallery_lateral = _gallery_lateral.to(_device)
     return len(_gallery_ids)
 
 
 # Global state (loaded at startup)
-_model, _gallery_embeddings, _gallery_ids, _device = None, None, None, None
+_model = None
+_gallery_embeddings = None
+_gallery_frontal = None
+_gallery_lateral = None
+_gallery_ids = None
+_device = None
 
 
 app = FastAPI(
@@ -201,9 +254,9 @@ app.add_middleware(
 
 @app.on_event("startup")
 def startup():
-    global _model, _gallery_embeddings, _gallery_ids, _device
+    global _model, _gallery_embeddings, _gallery_frontal, _gallery_lateral, _gallery_ids, _device
     try:
-        _model, _gallery_embeddings, _gallery_ids, _device = load_model_and_gallery()
+        _model, _gallery_embeddings, _gallery_frontal, _gallery_lateral, _gallery_ids, _device = load_model_and_gallery()
     except Exception as e:
         raise RuntimeError(f"Failed to load model or gallery: {e}") from e
 
@@ -223,6 +276,7 @@ class MatchItem(BaseModel):
     dog_id: str
     similarity: float
     percentage: float
+    confidence: float
 
 
 class MatchResponse(BaseModel):
@@ -254,11 +308,22 @@ def health():
 async def match(
     frontal: UploadFile = File(..., description="Frontal view image"),
     lateral: UploadFile = File(..., description="Lateral view image"),
-    top_k: int = Form(10, description="Number of top matches to return"),
+    top_k: int = Form(MATCH_DEFAULT_TOP_K, description="Final number of matches after re-ranking"),
+    retrieve_k: int = Form(
+        MATCH_RETRIEVE_K,
+        description="Initial retrieval size (e.g. 10); top candidates are re-ranked",
+    ),
+    min_rerank_cosine: Optional[float] = Form(
+        None,
+        description="Min re-rank cosine in [-1,1]; omit to use RERANK_MIN_COSINE env (-1 = off)",
+    ),
 ):
     """
     Match a found dog (frontal + lateral images) against the lost-dogs gallery.
-    Returns top-k most similar dogs with similarity score and percentage.
+
+    Flow: retrieve top ``retrieve_k`` by fused embedding cosine → re-rank with stricter
+    ensemble scores (fused + frontal + lateral cosines when gallery stores per-view
+    vectors) → return top ``top_k`` with confidence in [0, 1].
     """
     if _gallery_embeddings is None or len(_gallery_ids) == 0:
         raise HTTPException(
@@ -278,24 +343,54 @@ async def match(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid image: {e}") from e
     
+    rk = max(1, min(retrieve_k, len(_gallery_ids)))
+    min_cos = RERANK_MIN_COSINE if min_rerank_cosine is None else float(min_rerank_cosine)
+
     with torch.no_grad():
-        query_embedding = _model(frontal_tensor, lateral_tensor).squeeze(0)
-    
-    k = min(top_k, len(_gallery_ids))
+        query_fused = _model(frontal_tensor, lateral_tensor).squeeze(0)
+        query_frontal = _model.encode_frontal(frontal_tensor).squeeze(0)
+        query_lateral = _model.encode_lateral(lateral_tensor).squeeze(0)
+
     similarities, indices = cosine_similarity_search(
-        query_embedding, _gallery_embeddings, top_k=k
+        query_fused, _gallery_embeddings, top_k=rk
     )
-    
+
+    reranked = rerank_with_dual_view_ensemble(
+        query_fused,
+        query_frontal,
+        query_lateral,
+        _gallery_embeddings,
+        indices,
+        _gallery_frontal,
+        _gallery_lateral,
+        ENSEMBLE_W_FUSED,
+        ENSEMBLE_W_FRONT,
+        ENSEMBLE_W_LAT,
+        min_cos,
+    )
+
+    out_n = max(1, min(top_k, len(reranked)))
     matches = []
-    for sim, idx in zip(similarities.cpu().numpy(), indices.cpu().numpy()):
-        dog_id = _gallery_ids[idx]
-        sim_f = float(sim)
-        percentage = ((sim_f + 1) / 2) * 100
+    for gallery_row_idx, score, conf in reranked[:out_n]:
+        dog_id = _gallery_ids[gallery_row_idx]
+        percentage = ((score + 1) / 2) * 100
         matches.append(
-            MatchItem(dog_id=str(dog_id), similarity=round(sim_f, 4), percentage=round(percentage, 2))
+            MatchItem(
+                dog_id=str(dog_id),
+                similarity=round(float(score), 4),
+                percentage=round(float(percentage), 2),
+                confidence=round(float(conf), 4),
+            )
         )
-    
-    return MatchResponse(success=True, matches=matches)
+
+    msg = None
+    if _gallery_frontal is None or _gallery_lateral is None:
+        msg = (
+            "Gallery has no per-view embeddings; rebuild with POST /admin/rebuild-gallery "
+            "to enable frontal+lateral re-ranking ensemble."
+        )
+
+    return MatchResponse(success=True, matches=matches, message=msg)
 
 
 @app.post("/admin/rebuild-gallery")
@@ -344,6 +439,6 @@ def root():
         "message": "Dog Matching API",
         "docs": "/docs",
         "health": "/health",
-        "match": "POST /match (frontal, lateral multipart files; top_k optional)",
+        "match": "POST /match (frontal, lateral; top_k, retrieve_k, min_rerank_cosine optional)",
         "admin": "POST /admin/rebuild-gallery (from GALLERY_API_URL), POST /admin/reload-gallery",
     }
