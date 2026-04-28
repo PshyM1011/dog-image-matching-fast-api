@@ -285,6 +285,14 @@ class MatchResponse(BaseModel):
     message: Optional[str] = None
 
 
+class MatchByUrlRequest(BaseModel):
+    frontal_url: str
+    lateral_url: str
+    top_k: int = MATCH_DEFAULT_TOP_K
+    retrieve_k: int = MATCH_RETRIEVE_K
+    min_rerank_cosine: Optional[float] = None
+
+
 def preprocess_image(image_bytes: bytes) -> torch.Tensor:
     """Load image from bytes and apply test transforms; return tensor [1, C, H, W]."""
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
@@ -293,56 +301,26 @@ def preprocess_image(image_bytes: bytes) -> torch.Tensor:
     return tensor
 
 
-@app.get("/health")
-def health():
-    """Readiness check."""
-    return {
-        "status": "ok",
-        "checkpoint": CHECKPOINT_PATH,
-        "gallery_size": len(_gallery_ids) if _gallery_ids else 0,
-        "device": str(_device),
-    }
-
-
-@app.post("/match", response_model=MatchResponse)
-async def match(
-    frontal: UploadFile = File(..., description="Frontal view image"),
-    lateral: UploadFile = File(..., description="Lateral view image"),
-    top_k: int = Form(MATCH_DEFAULT_TOP_K, description="Final number of matches after re-ranking"),
-    retrieve_k: int = Form(
-        MATCH_RETRIEVE_K,
-        description="Initial retrieval size (e.g. 10); top candidates are re-ranked",
-    ),
-    min_rerank_cosine: Optional[float] = Form(
-        None,
-        description="Min re-rank cosine in [-1,1]; omit to use RERANK_MIN_COSINE env (-1 = off)",
-    ),
-):
-    """
-    Match a found dog (frontal + lateral images) against the lost-dogs gallery.
-
-    Flow: retrieve top ``retrieve_k`` by fused embedding cosine → re-rank with stricter
-    ensemble scores (fused + frontal + lateral cosines when gallery stores per-view
-    vectors) → return top ``top_k`` with confidence in [0, 1].
-    """
+def _run_match_from_image_bytes(
+    frontal_bytes: bytes,
+    lateral_bytes: bytes,
+    top_k: int,
+    retrieve_k: int,
+    min_rerank_cosine: Optional[float],
+) -> MatchResponse:
+    """Shared match pipeline used by file-upload and URL-based endpoints."""
     if _gallery_embeddings is None or len(_gallery_ids) == 0:
         raise HTTPException(
             status_code=503,
             detail="Gallery not loaded. Set GALLERY_PATH to a valid gallery_embeddings.pt file.",
         )
-    
-    try:
-        frontal_bytes = await frontal.read()
-        lateral_bytes = await lateral.read()
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to read uploads: {e}") from e
-    
+
     try:
         frontal_tensor = preprocess_image(frontal_bytes).to(_device)
         lateral_tensor = preprocess_image(lateral_bytes).to(_device)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid image: {e}") from e
-    
+
     rk = max(1, min(retrieve_k, len(_gallery_ids)))
     min_cos = RERANK_MIN_COSINE if min_rerank_cosine is None else float(min_rerank_cosine)
 
@@ -393,6 +371,80 @@ async def match(
     return MatchResponse(success=True, matches=matches, message=msg)
 
 
+@app.get("/health")
+def health():
+    """Readiness check."""
+    return {
+        "status": "ok",
+        "checkpoint": CHECKPOINT_PATH,
+        "gallery_size": len(_gallery_ids) if _gallery_ids else 0,
+        "device": str(_device),
+    }
+
+
+@app.post("/match", response_model=MatchResponse)
+async def match(
+    frontal: UploadFile = File(..., description="Frontal view image"),
+    lateral: UploadFile = File(..., description="Lateral view image"),
+    top_k: int = Form(MATCH_DEFAULT_TOP_K, description="Final number of matches after re-ranking"),
+    retrieve_k: int = Form(
+        MATCH_RETRIEVE_K,
+        description="Initial retrieval size (e.g. 10); top candidates are re-ranked",
+    ),
+    min_rerank_cosine: Optional[float] = Form(
+        None,
+        description="Min re-rank cosine in [-1,1]; omit to use RERANK_MIN_COSINE env (-1 = off)",
+    ),
+):
+    """
+    Match a found dog (frontal + lateral images) against the lost-dogs gallery.
+
+    Flow: retrieve top ``retrieve_k`` by fused embedding cosine → re-rank with stricter
+    ensemble scores (fused + frontal + lateral cosines when gallery stores per-view
+    vectors) → return top ``top_k`` with confidence in [0, 1].
+    """
+    try:
+        frontal_bytes = await frontal.read()
+        lateral_bytes = await lateral.read()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to read uploads: {e}") from e
+    return _run_match_from_image_bytes(
+        frontal_bytes=frontal_bytes,
+        lateral_bytes=lateral_bytes,
+        top_k=top_k,
+        retrieve_k=retrieve_k,
+        min_rerank_cosine=min_rerank_cosine,
+    )
+
+
+@app.post("/match-by-url", response_model=MatchResponse)
+def match_by_url(payload: MatchByUrlRequest):
+    """
+    Match using image URLs instead of multipart uploads.
+    Useful when backend already stores/receives image URLs and proxies to this API.
+    """
+    frontal_url = (payload.frontal_url or "").strip()
+    lateral_url = (payload.lateral_url or "").strip()
+    if not frontal_url or not lateral_url:
+        raise HTTPException(status_code=400, detail="frontal_url and lateral_url are required")
+
+    try:
+        frontal_bytes = _download_image(frontal_url, timeout=20)
+        lateral_bytes = _download_image(lateral_url, timeout=20)
+    except requests.RequestException as e:
+        raise HTTPException(status_code=400, detail=f"Failed to download image URL: {e}") from e
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to load image URL: {e}") from e
+
+    return _run_match_from_image_bytes(
+        frontal_bytes=frontal_bytes,
+        lateral_bytes=lateral_bytes,
+        top_k=payload.top_k,
+        retrieve_k=payload.retrieve_k,
+        min_rerank_cosine=payload.min_rerank_cosine,
+    )
+
+
 @app.post("/admin/rebuild-gallery")
 def admin_rebuild_gallery():
     """
@@ -440,5 +492,6 @@ def root():
         "docs": "/docs",
         "health": "/health",
         "match": "POST /match (frontal, lateral; top_k, retrieve_k, min_rerank_cosine optional)",
+        "match_by_url": "POST /match-by-url (frontal_url, lateral_url JSON; top_k, retrieve_k, min_rerank_cosine optional)",
         "admin": "POST /admin/rebuild-gallery (from GALLERY_API_URL), POST /admin/reload-gallery",
     }
